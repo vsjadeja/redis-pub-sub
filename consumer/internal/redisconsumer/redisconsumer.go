@@ -232,5 +232,7 @@ func (c *Consumer) serveHealth(ctx context.Context, addr string) {
 	}
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Printf("[redisconsumer] health server error: %v", err)
+	} else {
+		log.Printf("[redisconsumer] health server running at %s", addr)
 	}
 }

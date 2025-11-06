@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"time"
 
 	"consumer/internal/redisconsumer"
@@ -19,15 +22,26 @@ import (
 )
 
 func initTracer() (*sdktrace.TracerProvider, error) {
-	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint("http://localhost:14268/api/traces")))
+	jaegerHost := os.Getenv("JAEGER_HOST")
+	if jaegerHost == "" {
+		return nil, errors.New(`JAEGER_HOST is not set`)
+	}
+
+	jaegerPort := os.Getenv("JAEGER_PORT")
+	if jaegerPort == "" {
+		jaegerPort = "14268"
+	}
+	jaegerApiEndpoint := fmt.Sprintf("http://%s:%s/api/traces", jaegerHost, jaegerPort)
+	exp, err := jaeger.New(jaeger.WithCollectorEndpoint(jaeger.WithEndpoint(jaegerApiEndpoint)))
 	if err != nil {
 		return nil, err
 	}
+
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
-			semconv.ServiceName("redis-consumer"),
+			semconv.ServiceName("redis-consumers"),
 		)),
 	)
 	otel.SetTracerProvider(tp)
@@ -45,18 +59,44 @@ func main() {
 		}
 	}()
 
-	tracer := tp.Tracer("redis-consumer")
+	tracer := tp.Tracer("redis-consumers")
+
+	rHost := os.Getenv("REDIS_HOST")
+	if rHost == "" {
+		log.Fatal("REDIS_HOST is not set")
+	}
+
+	rPort := os.Getenv("REDIS_PORT")
+	if rPort == "" {
+		log.Fatal("REDIS_PORT is not set")
+	}
+
+	concurency := os.Getenv("CONCURRENCY")
+	if concurency == "" {
+		concurency = "1"
+	}
+	concurrency, _ := strconv.Atoi(concurency)
+
+	// Read streams names from environment variable
+	strStreams := os.Getenv("REDIS_STREAMS")
+	if strStreams == "" {
+		strStreams = "logs"
+	}
+	streams := []string{}
+	for _, s := range strings.Split(strStreams, ",") {
+		streams = append(streams, s)
+	}
 
 	cfg := redisconsumer.ConsumerConfig{
-		Addr:         "localhost:6380",
-		Password:     "redis123",
+		Addr:         fmt.Sprintf(`%s:%s`, rHost, rPort),
+		Password:     os.Getenv(`REDIS_PASSWORD`),
 		DB:           0,
-		Streams:      []string{"events", "logs", "notifications"},
+		Streams:      streams,
 		Group:        "workers",
 		ConsumerName: "c1",
-		Concurrency:  10, // 10 goroutines per stream
+		Concurrency:  concurrency, // N goroutines per stream
 		AckOnSuccess: true,
-		HealthAddr:   ":8083",
+		HealthAddr:   fmt.Sprintf(`:%s`, os.Getenv(`HEALTH_PORT`)),
 		Tracer:       tracer,
 	}
 
