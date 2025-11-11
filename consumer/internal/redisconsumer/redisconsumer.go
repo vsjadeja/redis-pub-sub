@@ -2,6 +2,7 @@ package redisconsumer
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -46,6 +47,22 @@ type Consumer struct {
 	// Tracking last poll time per stream
 	lastPollMu sync.Mutex
 	lastPoll   time.Time
+}
+
+type StreamOverview struct {
+	Stream string      `json:"stream"`
+	Groups []GroupInfo `json:"groups"`
+}
+
+type GroupInfo struct {
+	Name      string         `json:"name"`
+	Consumers []ConsumerInfo `json:"consumers"`
+}
+
+type ConsumerInfo struct {
+	Name    string `json:"name"`
+	Pending int64  `json:"pending"`
+	IdleMs  int64  `json:"idle_ms"`
 }
 
 func NewConsumer(cfg ConsumerConfig, handler Handler) (*Consumer, error) {
@@ -213,6 +230,68 @@ func (c *Consumer) Health() error {
 	return nil
 }
 
+func (c *Consumer) LiveConsumers() ([]StreamOverview, error) {
+	ctx := context.Background()
+	var cursor uint64
+	var streams []string
+
+	for {
+		// SCAN <cursor> TYPE stream
+		keys, nextCursor, err := c.client.ScanType(ctx, cursor, "*", 100, "stream").Result()
+		if err != nil {
+			log.Printf("[redisconsumer] scan type error: %v", err)
+			break
+		}
+		streams = append(streams, keys...)
+		cursor = nextCursor
+		if cursor == 0 {
+			break
+		}
+	}
+
+	var results []StreamOverview
+
+	for _, stream := range streams {
+		groups, err := c.client.XInfoGroups(ctx, stream).Result()
+		if err != nil {
+			log.Printf("[redisconsumer] xinfo groups error stream=%s: %v", stream, err)
+			continue
+		}
+
+		var groupInfos []GroupInfo
+		for _, g := range groups {
+			consumers, err := c.client.XInfoConsumers(ctx, stream, g.Name).Result()
+			if err != nil {
+				log.Printf("[redisconsumer] xinfo consumers error stream=%s group=%s: %v", stream, g.Name, err)
+				continue
+			}
+
+			var consumerInfos []ConsumerInfo
+			for _, ci := range consumers {
+				consumerInfos = append(consumerInfos, ConsumerInfo{
+					Name:    ci.Name,
+					Pending: ci.Pending,
+					IdleMs:  ci.Idle.Milliseconds(),
+				})
+			}
+
+			groupInfos = append(groupInfos, GroupInfo{
+				Name:      g.Name,
+				Consumers: consumerInfos,
+			})
+
+			log.Printf("[redisconsumer] stream=%s group=%s consumers=%d", stream, g.Name, len(consumers))
+		}
+
+		results = append(results, StreamOverview{
+			Stream: stream,
+			Groups: groupInfos,
+		})
+	}
+
+	return results, nil
+}
+
 func (c *Consumer) serveHealth(ctx context.Context, addr string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -222,6 +301,15 @@ func (c *Consumer) serveHealth(ctx context.Context, addr string) {
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/streams", func(w http.ResponseWriter, r *http.Request) {
+		data, err := c.LiveConsumers()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(data)
 	})
 	srv := &http.Server{
 		Addr:    addr,
